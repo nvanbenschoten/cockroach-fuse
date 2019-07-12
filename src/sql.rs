@@ -77,6 +77,32 @@ pub fn create_inode(
     Ok(attr)
 }
 
+pub fn unlink(
+    conn: &Connection,
+    parent: u64,
+    name: &str,
+) -> Result<Option<()>> {
+    println!("unlink: {} in {}", name, parent);
+    let txn = conn.transaction()?;
+    let mut inode = match lookup_dir_ent(&txn, parent, name)? {
+        Some(dir_ent) => dir_ent,
+        None => return Ok(None),
+    };
+    txn.execute(
+        "DELETE FROM dir_entries
+         WHERE (dir_ino, child_name, child_ino) = ($1, $2, $3)",
+        &[&(parent as i64), &name, &(inode.ino as i64)],
+    )?;
+    inode.nlink -= 1;
+    if inode.nlink == 0 {
+        delete_file(&txn, inode.ino)?;
+    } else {
+        update_nlink(&txn, inode.ino, inode.nlink)?;
+    }
+    txn.commit()?;
+    return Ok(Some(()));
+}
+
 pub fn link(
     conn: &Connection, 
     ino: u64,
@@ -90,6 +116,10 @@ pub fn link(
         Some(inode) => inode,
         None => return Ok(None),
     };
+    // TODO(ajwerner): return a better error if inode is a dir.
+    if inode.kind != FileType::RegularFile {
+        return Ok(None);
+    }
     let kind_str = file_type_to_str(inode.kind);
     txn.execute(
         "INSERT INTO dir_entries
@@ -97,14 +127,10 @@ pub fn link(
          &[&(parent as i64), &newname, &kind_str, &(ino as i64)],
     )?;
     inode.nlink += 1;
-    conn.execute("UPDATE inodes
-                  SET (nlink) = ($1)
-                  WHERE (ino) = ($2)",
-                 &[&(inode.nlink as i32), &(ino as i64)])?;
+    update_nlink(&txn, inode.ino, inode.nlink)?;
     txn.commit()?;
     Ok(Some(inode))
 }
-
 
 pub fn lookup_inode_kind(conn: &Connection, ino: u64) -> Result<Option<FileType>> {
     conn.query("SELECT kind FROM inodes WHERE ino = $1", &[&(ino as i64)])
@@ -148,7 +174,19 @@ pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry
     })
 }
 
-pub fn lookup_dir_ent(conn: &Connection, parent: u64, name: &str) -> Result<Option<FileAttr>> {
+pub fn delete_file<C: GenericConnection>(conn: &C, ino: u64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM inodes WHERE ino = $1",
+        &[&(ino as i64)],
+    )?;
+    conn.execute(
+        "DELETE FROM blocks WHERE file_ino = $1",
+        &[&(ino as i64)],
+    )?;
+    Ok(())
+}
+
+pub fn lookup_dir_ent<C: GenericConnection>(conn: &C, parent: u64, name: &str) -> Result<Option<FileAttr>> {
     conn.query(
         "SELECT i.* FROM inodes i 
          JOIN dir_entries d 
@@ -163,6 +201,20 @@ pub fn lookup_dir_ent(conn: &Connection, parent: u64, name: &str) -> Result<Opti
             Some(row_to_file_attr(rows.get(0)))
         }
     })
+}
+
+pub fn update_nlink<C: GenericConnection>(
+    conn: &C,
+    ino: u64,
+    nlink: u32,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE inodes
+         SET (nlink) = ($1)
+         WHERE (ino) = ($2)",
+        &[&(nlink as i32), &(ino as i64)],
+    )?;
+    return Ok(());
 }
 
 pub fn rename_dir_ent(

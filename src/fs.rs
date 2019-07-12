@@ -167,6 +167,19 @@ impl Filesystem for CockroachFS {
         };
     }
 
+    /// Remove a file.
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match sql::unlink(
+            &self.conn,
+            parent,
+            name.to_str().unwrap(),
+        ) {
+            Err(_) => reply.error(ECONNREFUSED),
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(_)) => reply.ok(),
+        };
+    }
+
 
     /// Read data.
     /// Read should send exactly the number of bytes requested except on EOF or error,
