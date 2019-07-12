@@ -1,6 +1,6 @@
 use fuse::{FileAttr, FileType};
 use postgres::rows::Row;
-use postgres::{Connection, Result};
+use postgres::{Connection, Result, GenericConnection};
 
 const SCHEMAS: &[&str] = &[
     "CREATE SEQUENCE IF NOT EXISTS inode_alloc",
@@ -34,6 +34,7 @@ const SCHEMAS: &[&str] = &[
     )",
 ];
 
+#[derive(Debug)]
 pub struct DirEntry {
     pub dir_ino: u64,
     pub child_ino: u64,
@@ -76,6 +77,35 @@ pub fn create_inode(
     Ok(attr)
 }
 
+pub fn link(
+    conn: &Connection, 
+    ino: u64,
+    parent: u64,
+    newname: &str,
+) -> Result<Option<FileAttr>> {
+    println!("link: {} as {} in {}", ino, newname, parent);
+    let txn = conn.transaction()?;
+    let inode_opt = lookup_inode(&txn, ino)?;
+    let mut inode = match inode_opt {
+        Some(inode) => inode,
+        None => return Ok(None),
+    };
+    let kind_str = file_type_to_str(inode.kind);
+    txn.execute(
+        "INSERT INTO dir_entries
+         VALUES ($1, $2, $3, $4)",
+         &[&(parent as i64), &newname, &kind_str, &(ino as i64)],
+    )?;
+    inode.nlink += 1;
+    conn.execute("UPDATE inodes
+                  SET (nlink) = ($1)
+                  WHERE (ino) = ($2)",
+                 &[&(inode.nlink as i32), &(ino as i64)])?;
+    txn.commit()?;
+    Ok(Some(inode))
+}
+
+
 pub fn lookup_inode_kind(conn: &Connection, ino: u64) -> Result<Option<FileType>> {
     conn.query("SELECT kind FROM inodes WHERE ino = $1", &[&(ino as i64)])
         .map(|rows| {
@@ -87,7 +117,7 @@ pub fn lookup_inode_kind(conn: &Connection, ino: u64) -> Result<Option<FileType>
         })
 }
 
-pub fn lookup_inode(conn: &Connection, ino: u64) -> Result<Option<FileAttr>> {
+pub fn lookup_inode<C: GenericConnection>(conn: &C, ino: u64) -> Result<Option<FileAttr>> {
     conn.query("SELECT * FROM inodes WHERE ino = $1", &[&(ino as i64)])
         .map(|rows| {
             if rows.len() == 0 {
@@ -103,32 +133,10 @@ pub fn lookup_inode(conn: &Connection, ino: u64) -> Result<Option<FileAttr>> {
 // }
 
 pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry>> {
-    if offset != 0 {
-        let offset_name: String = conn
-            .query(
-                "SELECT child_name FROM dir_entries WHERE dir_ino = $1 AND child_ino = $2",
-                &[&(ino as i64), &offset],
-            )
-            .map(|rows| {
-                if rows.len() == 0 {
-                    None
-                } else {
-                    Some(rows.get(0).get(0))
-                }
-            })?
-            .unwrap();
-
-        conn.query(
-            "SELECT * FROM dir_entries WHERE dir_ino = $1 AND child_name > $2",
-            &[&(ino as i64), &offset_name],
-        )
-    } else {
-        conn.query(
-            "SELECT * FROM dir_entries WHERE dir_ino = $1",
-            &[&(ino as i64)],
-        )
-    }
-    .map(|rows| {
+    conn.query(
+        "SELECT * FROM dir_entries WHERE dir_ino = $1 ORDER BY child_name OFFSET $2 ROWS",
+        &[&(ino as i64), &(offset)],
+    ).map(|rows| {
         rows.iter()
             .map(|row| DirEntry {
                 dir_ino: row.get::<_, i64>(0) as u64,

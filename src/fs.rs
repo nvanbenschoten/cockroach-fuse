@@ -21,6 +21,7 @@ impl CockroachFS {
 }
 
 impl Filesystem for CockroachFS {
+    
     /// Initialize filesystem.
     /// Called before any other filesystem method.
     fn init(&mut self, _req: &Request) -> Result<(), c_int> {
@@ -149,6 +150,24 @@ impl Filesystem for CockroachFS {
         };
     }
 
+    /// Create a hard link.
+    fn link(&mut self, _req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        match sql::link(
+            &self.conn,
+            ino,
+            newparent,
+            newname.to_str().unwrap(),
+        ) {
+            Err(err) => {
+                println!("link: {}", err);
+                reply.error(ECONNREFUSED)
+            },
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(attr)) => reply.entry(&TTL, &attr, 0),
+        };
+    }
+
+
     /// Read data.
     /// Read should send exactly the number of bytes requested except on EOF or error,
     /// otherwise the rest of the data will be substituted with zeroes. An exception to
@@ -186,7 +205,7 @@ impl Filesystem for CockroachFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        println!("readdir {}", ino);
+        println!("readdir {} {}", ino, offset);
         let errno = match sql::lookup_inode_kind(&self.conn, ino) {
             Err(_) => ECONNREFUSED,
             Ok(None) => ENOENT,
@@ -197,16 +216,18 @@ impl Filesystem for CockroachFS {
             reply.error(errno);
             return;
         }
-
         match sql::read_dir(&self.conn, ino, offset) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                println!("failed to read_dir: {}", err);
+                reply.error(ECONNREFUSED)
+            },
             Ok(ents) => {
-                for ent in ents {
+                for (i, ent) in ents.iter().enumerate() {
                     reply.add(
                         ent.child_ino,
-                        ent.child_ino as i64,
+                        offset+1+(i as i64),
                         ent.child_kind,
-                        ent.child_name,
+                        &ent.child_name,
                     );
                 }
                 reply.ok();
