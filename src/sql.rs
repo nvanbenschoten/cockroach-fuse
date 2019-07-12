@@ -98,6 +98,10 @@ pub fn lookup_inode(conn: &Connection, ino: u64) -> Result<Option<FileAttr>> {
         })
 }
 
+//pub fn update_inode(conn: &Connection, attr: FileAttr) -> Result<Option<FileAttr>> {
+
+// }
+
 pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry>> {
     if offset != 0 {
         let offset_name: String = conn
@@ -136,7 +140,7 @@ pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry
     })
 }
 
-pub fn lookup_dir(conn: &Connection, parent: u64, name: &str) -> Result<Option<FileAttr>> {
+pub fn lookup_dir_ent(conn: &Connection, parent: u64, name: &str) -> Result<Option<FileAttr>> {
     conn.query(
         "SELECT i.* FROM inodes i 
          JOIN dir_entries d 
@@ -151,6 +155,22 @@ pub fn lookup_dir(conn: &Connection, parent: u64, name: &str) -> Result<Option<F
             Some(row_to_file_attr(rows.get(0)))
         }
     })
+}
+
+pub fn rename_dir_ent(
+    conn: &Connection,
+    parent: u64,
+    name: &str,
+    new_parent: u64,
+    new_name: &str,
+) -> Result<bool> {
+    conn.execute(
+        "UPDATE dir_entries
+         SET   (dir_ino, child_name) = ($1, $2)
+         WHERE (dir_ino, child_name) = ($3, $4)",
+        &[&(new_parent as i64), &new_name, &(parent as i64), &name],
+    )
+    .map(|num| num == 1)
 }
 
 fn row_to_file_attr(row: Row) -> FileAttr {

@@ -1,5 +1,7 @@
 use super::sql;
-use fuse::{FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request};
+use fuse::{
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, Request,
+};
 use libc::{c_int, ECONNREFUSED, ENOENT, ENOTDIR};
 use std::ffi::OsStr;
 use time::Timespec;
@@ -40,7 +42,7 @@ impl Filesystem for CockroachFS {
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup {} {}", parent, name.to_str().unwrap());
-        match sql::lookup_dir(&self.conn, parent, name.to_str().unwrap()) {
+        match sql::lookup_dir_ent(&self.conn, parent, name.to_str().unwrap()) {
             Err(_) => reply.error(ECONNREFUSED),
             Ok(None) => reply.error(ENOENT),
             Ok(Some(attr)) => {
@@ -59,6 +61,33 @@ impl Filesystem for CockroachFS {
             Ok(Some(attr)) => reply.attr(&TTL, &attr),
         };
     }
+
+    // /// Set file attributes.
+    // fn setattr(
+    //     &mut self,
+    //     _req: &Request,
+    //     ino: u64,
+    //     mode: Option<u32>,
+    //     uid: Option<u32>,
+    //     gid: Option<u32>,
+    //     size: Option<u64>,
+    //     atime: Option<Timespec>,
+    //     mtime: Option<Timespec>,
+    //     _fh: Option<u64>,
+    //     crtime: Option<Timespec>,
+    //     chgtime: Option<Timespec>,
+    //     _bkuptime: Option<Timespec>,
+    //     flags: Option<u32>,
+    //     reply: ReplyAttr,
+    // ) {
+    //     println!("setattr {}", ino);
+    //     match sql::update_inode(&self.conn, ino) {
+    //         Err(_) => reply.error(ECONNREFUSED),
+    //         Ok(None) => reply.error(ENOENT),
+    //         Ok(Some(attr)) => reply.attr(&TTL, &attr),
+    //     };
+    //     reply.error(ENOSYS);
+    // }
 
     /// Create file node.
     /// Create a regular file, character device, block device, fifo or socket node.
@@ -94,6 +123,29 @@ impl Filesystem for CockroachFS {
         ) {
             Err(_) => reply.error(ECONNREFUSED),
             Ok(attr) => reply.entry(&TTL, &attr, 0),
+        };
+    }
+
+    /// Rename a file.
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        match sql::rename_dir_ent(
+            &self.conn,
+            parent,
+            name.to_str().unwrap(),
+            newparent,
+            newname.to_str().unwrap(),
+        ) {
+            Err(_) => reply.error(ECONNREFUSED),
+            Ok(false) => reply.error(ENOENT),
+            Ok(true) => reply.ok(),
         };
     }
 
