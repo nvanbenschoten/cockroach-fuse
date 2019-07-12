@@ -152,7 +152,7 @@ impl Filesystem for CockroachFS {
                 for ent in ents {
                     reply.add(
                         ent.child_ino,
-                        ent.child_ino as i64 + 1,
+                        ent.child_ino as i64,
                         ent.child_kind,
                         ent.child_name,
                     );

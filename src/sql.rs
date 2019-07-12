@@ -99,18 +99,38 @@ pub fn lookup_inode(conn: &Connection, ino: u64) -> Result<Option<FileAttr>> {
 }
 
 pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry>> {
-    conn.query(
-        // TODO fix offset
-        "SELECT * FROM dir_entries WHERE dir_ino = $1 AND child_ino >= $2",
-        &[&(ino as i64), &offset],
-    )
+    if offset != 0 {
+        let offset_name: String = conn
+            .query(
+                "SELECT child_name FROM dir_entries WHERE dir_ino = $1 AND child_ino = $2",
+                &[&(ino as i64), &offset],
+            )
+            .map(|rows| {
+                if rows.len() == 0 {
+                    None
+                } else {
+                    Some(rows.get(0).get(0))
+                }
+            })?
+            .unwrap();
+
+        conn.query(
+            "SELECT * FROM dir_entries WHERE dir_ino = $1 AND child_name > $2",
+            &[&(ino as i64), &offset_name],
+        )
+    } else {
+        conn.query(
+            "SELECT * FROM dir_entries WHERE dir_ino = $1",
+            &[&(ino as i64)],
+        )
+    }
     .map(|rows| {
         rows.iter()
             .map(|row| DirEntry {
                 dir_ino: row.get::<_, i64>(0) as u64,
-                child_name: row.get(3),
+                child_name: row.get(1),
                 child_kind: str_to_file_type(row.get(2)).unwrap(),
-                child_ino: row.get::<_, i64>(1) as u64,
+                child_ino: row.get::<_, i64>(3) as u64,
             })
             .collect()
     })
