@@ -3,7 +3,9 @@ use fuse::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite,
     Request,
 };
-use libc::{c_int, ECONNREFUSED, ENOENT, ENOTDIR};
+use libc::{c_int, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
+use libc::{ECONNREFUSED, EEXIST, ENOENT, ENOTDIR};
+use postgres::error;
 use std::ffi::OsStr;
 use time::Timespec;
 
@@ -44,7 +46,10 @@ impl Filesystem for CockroachFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup {} {}", parent, name.to_str().unwrap());
         match sql::lookup_dir_ent(&self.conn, parent, name.to_str().unwrap()) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("lookup {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(None) => reply.error(ENOENT),
             Ok(Some(attr)) => {
                 println!("lookup found {}", name.to_str().unwrap());
@@ -57,38 +62,46 @@ impl Filesystem for CockroachFS {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         println!("getattr {}", ino);
         match sql::lookup_inode(&self.conn, ino) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("getattr {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(None) => reply.error(ENOENT),
             Ok(Some(attr)) => reply.attr(&TTL, &attr),
         };
     }
 
-    // /// Set file attributes.
-    // fn setattr(
-    //     &mut self,
-    //     _req: &Request,
-    //     ino: u64,
-    //     mode: Option<u32>,
-    //     uid: Option<u32>,
-    //     gid: Option<u32>,
-    //     size: Option<u64>,
-    //     atime: Option<Timespec>,
-    //     mtime: Option<Timespec>,
-    //     _fh: Option<u64>,
-    //     crtime: Option<Timespec>,
-    //     chgtime: Option<Timespec>,
-    //     _bkuptime: Option<Timespec>,
-    //     flags: Option<u32>,
-    //     reply: ReplyAttr,
-    // ) {
-    //     println!("setattr {}", ino);
-    //     match sql::update_inode(&self.conn, ino) {
-    //         Err(_) => reply.error(ECONNREFUSED),
-    //         Ok(None) => reply.error(ENOENT),
-    //         Ok(Some(attr)) => reply.attr(&TTL, &attr),
-    //     };
-    //     reply.error(ENOSYS);
-    // }
+    /// Set file attributes.
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+        _fh: Option<u64>,
+        crtime: Option<Timespec>,
+        chgtime: Option<Timespec>,
+        _bkuptime: Option<Timespec>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        println!("setattr {}", ino);
+        let (kind, perm) = optional_kind_and_perm_from_mode(mode);
+        match sql::update_inode(
+            &self.conn, ino, size, atime, mtime, chgtime, crtime, kind, perm, uid, gid, flags,
+        ) {
+            Err(err) => {
+                eprintln!("setattr {}", err);
+                reply.error(ECONNREFUSED)
+            }
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(attr)) => reply.attr(&TTL, &attr),
+        };
+    }
 
     /// Create file node.
     /// Create a regular file, character device, block device, fifo or socket node.
@@ -108,7 +121,10 @@ impl Filesystem for CockroachFS {
             FileType::RegularFile,
             rdev,
         ) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("mknod {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(attr) => reply.entry(&TTL, &attr, 0),
         };
     }
@@ -122,7 +138,10 @@ impl Filesystem for CockroachFS {
             FileType::Directory,
             0,
         ) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("mkdir {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(attr) => reply.entry(&TTL, &attr, 0),
         };
     }
@@ -130,7 +149,10 @@ impl Filesystem for CockroachFS {
     /// Remove a file.
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         match sql::unlink(&self.conn, parent, name.to_str().unwrap()) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("unlink {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(None) => reply.error(ENOENT),
             Ok(Some(_)) => reply.ok(),
         };
@@ -153,7 +175,11 @@ impl Filesystem for CockroachFS {
             newparent,
             newname.to_str().unwrap(),
         ) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(ref err) if err.code() == Some(&error::UNIQUE_VIOLATION) => reply.error(EEXIST),
+            Err(err) => {
+                eprintln!("rename {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(false) => reply.error(ENOENT),
             Ok(true) => reply.ok(),
         };
@@ -170,7 +196,7 @@ impl Filesystem for CockroachFS {
     ) {
         match sql::link(&self.conn, ino, newparent, newname.to_str().unwrap()) {
             Err(err) => {
-                println!("link: {}", err);
+                eprintln!("link {}", err);
                 reply.error(ECONNREFUSED)
             }
             Ok(None) => reply.error(ENOENT),
@@ -196,7 +222,10 @@ impl Filesystem for CockroachFS {
     ) {
         println!("read");
         match sql::read_data(&self.conn, ino, offset, size as usize) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("read {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(None) => reply.error(ENOENT),
             Ok(Some(data)) => reply.data(data.as_slice()),
         };
@@ -220,7 +249,10 @@ impl Filesystem for CockroachFS {
     ) {
         println!("write");
         match sql::write_data(&self.conn, ino, offset, data) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("write {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(None) => reply.error(ENOENT),
             Ok(Some(size)) => reply.written(size as u32),
         };
@@ -248,7 +280,10 @@ impl Filesystem for CockroachFS {
     ) {
         println!("readdir {} {}", ino, offset);
         let errno = match sql::lookup_inode_kind(&self.conn, ino) {
-            Err(_) => ECONNREFUSED,
+            Err(err) => {
+                eprintln!("readdir {}", err);
+                ECONNREFUSED
+            }
             Ok(None) => ENOENT,
             Ok(Some(FileType::Directory)) => 0,
             Ok(Some(_)) => ENOTDIR,
@@ -258,7 +293,10 @@ impl Filesystem for CockroachFS {
             return;
         }
         match sql::read_dir(&self.conn, ino, offset) {
-            Err(_) => reply.error(ECONNREFUSED),
+            Err(err) => {
+                eprintln!("readdir {}", err);
+                reply.error(ECONNREFUSED)
+            }
             Ok(ents) => {
                 for (i, ent) in ents.iter().enumerate() {
                     reply.add(
@@ -271,5 +309,31 @@ impl Filesystem for CockroachFS {
                 reply.ok();
             }
         };
+    }
+}
+
+fn kind_and_perm_from_mode(mode: u32) -> (FileType, u16) {
+    let perm = mode as u16;
+    let kind = match ((mode as u16) >> 12) << 12 {
+        S_IFIFO => Some(FileType::NamedPipe),
+        S_IFCHR => Some(FileType::CharDevice),
+        S_IFBLK => Some(FileType::BlockDevice),
+        S_IFDIR => Some(FileType::Directory),
+        S_IFREG => Some(FileType::RegularFile),
+        S_IFLNK => Some(FileType::Symlink),
+        S_IFSOCK => Some(FileType::Socket),
+        _ => None,
+    }
+    .unwrap();
+    (kind, perm)
+}
+
+fn optional_kind_and_perm_from_mode(mode: Option<u32>) -> (Option<FileType>, Option<u16>) {
+    match mode {
+        None => (None, None),
+        Some(mode) => {
+            let (kind, perm) = kind_and_perm_from_mode(mode);
+            (Some(kind), Some(perm))
+        }
     }
 }

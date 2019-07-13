@@ -2,23 +2,38 @@ use fuse::{FileAttr, FileType};
 use postgres::rows::Row;
 use postgres::{GenericConnection, Result};
 use std::cmp;
+use time::Timespec;
 
 const SCHEMAS: &[&str] = &[
     "CREATE SEQUENCE IF NOT EXISTS inode_alloc",
     "CREATE TABLE IF NOT EXISTS inodes (
+        -- Inode number
         ino    INT8      NOT NULL PRIMARY KEY DEFAULT nextval('inode_alloc'),
+        -- Size in bytes
         size   INT8      NOT NULL DEFAULT 0,
+        -- Size in blocks
         blocks INT8      NOT NULL DEFAULT 0,
+        -- Time of last access
         atime  TIMESTAMP NOT NULL DEFAULT now(),
+        -- Time of last modification
         mtime  TIMESTAMP NOT NULL DEFAULT now(),
+        -- Time of last change
         ctime  TIMESTAMP NOT NULL DEFAULT now(),
+        -- Time of creation (macOS only)
         crtime TIMESTAMP NOT NULL DEFAULT now(),
+        -- Kind of file (directory, file, pipe, etc)
         kind   STRING    NOT NULL,
+        -- Permissions
         perm   INT2      NOT NULL DEFAULT 493,
+        -- Number of hard links
         nlink  INT4      NOT NULL DEFAULT 1,
+        -- User id
         uid    INT4      NOT NULL DEFAULT 501,
+        -- Group id
         gid    INT4      NOT NULL DEFAULT 20,
+        -- Rdev
         rdev   INT4      NOT NULL DEFAULT 0,
+        -- Flags (macOS only, see chflags(2))
         flags  INT4      NOT NULL DEFAULT 0
     )",
     "CREATE TABLE IF NOT EXISTS dir_entries (
@@ -29,7 +44,7 @@ const SCHEMAS: &[&str] = &[
         PRIMARY KEY (dir_ino, child_name)
     )",
     "CREATE TABLE IF NOT EXISTS blocks (
-        file_ino  INT8 NOT NULL REFERENCES inodes (ino),
+        file_ino  INT8 NOT NULL REFERENCES inodes (ino) ON DELETE CASCADE,
         block_idx INT8 NOT NULL,
         bytes     BYTES NOT NULL DEFAULT repeat(x'00'::string, 1024)::bytes,
         PRIMARY KEY (file_ino, block_idx)
@@ -154,9 +169,57 @@ pub fn lookup_inode<C: GenericConnection>(conn: &C, ino: u64) -> Result<Option<F
         })
 }
 
-//pub fn update_inode(conn: &Connection, attr: FileAttr) -> Result<Option<FileAttr>> {
-
-// }
+pub fn update_inode<C: GenericConnection>(
+    conn: &C,
+    ino: u64,
+    size: Option<u64>,
+    atime: Option<Timespec>,
+    mtime: Option<Timespec>,
+    chgtime: Option<Timespec>,
+    crtime: Option<Timespec>,
+    kind: Option<FileType>,
+    perm: Option<u16>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    flags: Option<u32>,
+) -> Result<Option<FileAttr>> {
+    let file_type = kind.map(file_type_to_str);
+    conn.query(
+        "UPDATE inodes SET
+           size   = IFNULL($1, size),
+           atime  = IFNULL($2, atime),
+           mtime  = IFNULL($3, mtime),
+           ctime  = IFNULL($4, ctime),
+           crtime = IFNULL($5, crtime),
+           kind   = IFNULL($6, kind),
+           perm   = IFNULL($7, perm),
+           uid    = IFNULL($8, uid),
+           gid    = IFNULL($9, gid),
+           flags  = IFNULL($10, flags)
+         WHERE ino = $11
+         RETURNING *",
+        &[
+            &size.map(|s| s as i64),
+            &atime,
+            &mtime,
+            &chgtime,
+            &crtime,
+            &file_type,
+            &perm.map(|p| p as i16),
+            &uid.map(|p| p as i32),
+            &gid.map(|p| p as i32),
+            &flags.map(|p| p as i32),
+            &(ino as i64),
+        ],
+    )
+    .map(|rows| {
+        if rows.len() == 0 {
+            None
+        } else {
+            Some(row_to_file_attr(rows.get(0)))
+        }
+    })
+}
 
 pub fn read_dir<C: GenericConnection>(conn: &C, ino: u64, offset: i64) -> Result<Vec<DirEntry>> {
     conn.query(
@@ -219,13 +282,25 @@ pub fn rename_dir_ent<C: GenericConnection>(
     new_parent: u64,
     new_name: &str,
 ) -> Result<bool> {
-    conn.execute(
+    let txn = conn.transaction()?;
+    txn.execute(
+        "DELETE FROM dir_entries
+         WHERE (dir_ino, child_name) = ($1, $2)",
+        &[&(new_parent as i64), &new_name],
+    )?;
+    let num = txn.execute(
         "UPDATE dir_entries
          SET   (dir_ino, child_name) = ($1, $2)
          WHERE (dir_ino, child_name) = ($3, $4)",
         &[&(new_parent as i64), &new_name, &(parent as i64), &name],
-    )
-    .map(|num| num == 1)
+    )?;
+    if num == 0 {
+        txn.set_rollback();
+        txn.finish()?;
+        return Ok(false);
+    }
+    txn.commit()?;
+    Ok(true)
 }
 
 pub fn read_data<C: GenericConnection>(
@@ -359,7 +434,7 @@ pub fn write_data<C: GenericConnection>(
     let new_size = cmp::max(cur_size, touched_size);
     let new_blocks = cur_blocks + created_blocks as i64;
     let num_updated = txn.execute(
-        "UPDATE inodes SET blocks = $1, size = $2 WHERE ino = $3",
+        "UPDATE inodes SET size = $1, blocks = $2 WHERE ino = $3",
         &[&new_size, &new_blocks, &(ino as i64)],
     )?;
     if num_updated != 1 {
