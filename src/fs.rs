@@ -259,7 +259,7 @@ impl Filesystem for CockroachFS {
         _flags: u32,
         reply: ReplyWrite,
     ) {
-        println!("write");
+        println!("write {} bytes to {}", data.len(), ino);
         match sql::write_data(&self.conn, ino, offset, data) {
             Err(err) => {
                 eprintln!("write {}", err);

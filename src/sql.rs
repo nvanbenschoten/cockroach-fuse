@@ -37,21 +37,21 @@ const SCHEMAS: &[&str] = &[
         flags  INT4      NOT NULL DEFAULT 0
     )",
     "CREATE TABLE IF NOT EXISTS dir_entries (
-        dir_ino    INT8   NOT NULL REFERENCES inodes (ino),
+        dir_ino    INT8   NOT NULL REFERENCES inodes (ino) ON DELETE RESTRICT,
         child_name STRING NOT NULL,
         child_kind STRING NOT NULL,
         child_ino  INT8   NOT NULL, -- REFERENCES inodes (ino)
         PRIMARY KEY (dir_ino, child_name)
     )",
     "CREATE TABLE IF NOT EXISTS blocks (
-        file_ino  INT8 NOT NULL REFERENCES inodes (ino) ON DELETE CASCADE,
-        block_idx INT8 NOT NULL,
-        bytes     BYTES NOT NULL DEFAULT repeat(x'00'::string, 1024)::bytes,
+        file_ino  INT8  NOT NULL REFERENCES inodes (ino) ON DELETE CASCADE,
+        block_idx INT8  NOT NULL,
+        bytes     BYTES NOT NULL DEFAULT repeat(x'00'::STRING, 8192)::BYTES CHECK (length(bytes) = 8192),
         PRIMARY KEY (file_ino, block_idx)
     )",
 ];
 
-const DATA_BLOCK_SIZE: i64 = 1 << 10;
+const DATA_BLOCK_SIZE: i64 = 8 << 10 /* 8KB */;
 
 #[derive(Debug)]
 pub struct DirEntry {
@@ -324,6 +324,7 @@ pub fn read_data<C: GenericConnection>(
 
     let start_block = offset / DATA_BLOCK_SIZE;
     let end_block = (offset + size as i64) / DATA_BLOCK_SIZE;
+    let max_size = (end_block - start_block + 1) * DATA_BLOCK_SIZE;
     let mut data = txn
         .query(
             "SELECT bytes FROM blocks 
@@ -332,10 +333,13 @@ pub fn read_data<C: GenericConnection>(
         )?
         .into_iter()
         .map(|row| row.get::<_, Vec<u8>>(0))
-        .fold(Vec::with_capacity(size), |mut data, mut bytes| {
-            data.append(&mut bytes);
-            data
-        });
+        .fold(
+            Vec::with_capacity(max_size as usize),
+            |mut data, mut bytes| {
+                data.append(&mut bytes);
+                data
+            },
+        );
     data.truncate(size);
 
     txn.commit()?;
@@ -389,25 +393,33 @@ pub fn write_data<C: GenericConnection>(
         let after = avail - chunk_size;
         if cur_blocks <= cur_block {
             // Create new block.
-            txn.execute(
-                "INSERT INTO blocks
-                 VALUES ($1, $2, repeat(x'00'::string, $3)::bytes || $4 || repeat(x'00'::string, $5)::bytes)",
-                &[
-                    &(ino as i64),
-                    &(cur_block as i64),
-                    &(cur_offset as i64),
-                    &chunk,
-                    &(after as i64),
-                ],
-            )?;
+            if cur_offset == 0 && after == 0 {
+                // Fast path.
+                txn.execute(
+                    "INSERT INTO blocks VALUES ($1, $2, $3)",
+                    &[&(ino as i64), &(cur_block as i64), &chunk],
+                )
+            } else {
+                txn.execute(
+                    "INSERT INTO blocks
+                     VALUES ($1, $2, repeat(x'00'::string, $3)::bytes || $4 || repeat(x'00'::string, $5)::bytes)",
+                    &[
+                        &(ino as i64),
+                        &(cur_block as i64),
+                        &(cur_offset as i64),
+                        &chunk,
+                        &(after as i64),
+                    ],
+                )
+            }?;
             created_blocks = created_blocks + 1;
         } else {
             // Modify cur block.
             txn.execute(
                 "UPDATE blocks
-                 SET bytes = substr(convert_from(bytes, 'utf8'), 1, $1)::bytes || 
-                             $2 || 
-                             substr(convert_from(bytes, 'utf8'), $3+1)::bytes
+                 SET bytes = convert_to(substr(convert_from(bytes, 'latin1'), 1, $1), 'latin1') ||
+                             $2 ||
+                             convert_to(substr(convert_from(bytes, 'latin1'), $3+1), 'latin1')
                  WHERE file_ino = $4 AND block_idx = $5",
                 &[
                     &(cur_offset as i64),
