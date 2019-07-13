@@ -158,6 +158,18 @@ impl Filesystem for CockroachFS {
         };
     }
 
+    /// Remove a directory.
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match sql::unlink(&self.conn, parent, name.to_str().unwrap()) {
+            Err(err) => {
+                eprintln!("rmdir {}", err);
+                reply.error(ECONNREFUSED)
+            }
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(_)) => reply.ok(),
+        };
+    }
+
     /// Rename a file.
     fn rename(
         &mut self,

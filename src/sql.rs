@@ -110,7 +110,7 @@ pub fn unlink<C: GenericConnection>(conn: &C, parent: u64, name: &str) -> Result
     )?;
     inode.nlink -= 1;
     if inode.nlink == 0 {
-        delete_file(&txn, inode.ino)?;
+        txn.execute("DELETE FROM inodes WHERE ino = $1", &[&(inode.ino as i64)])?;
     } else {
         update_nlink(&txn, inode.ino, inode.nlink)?;
     }
@@ -236,12 +236,6 @@ pub fn read_dir<C: GenericConnection>(conn: &C, ino: u64, offset: i64) -> Result
             })
             .collect()
     })
-}
-
-pub fn delete_file<C: GenericConnection>(conn: &C, ino: u64) -> Result<()> {
-    conn.execute("DELETE FROM inodes WHERE ino = $1", &[&(ino as i64)])?;
-    conn.execute("DELETE FROM blocks WHERE file_ino = $1", &[&(ino as i64)])?;
-    Ok(())
 }
 
 pub fn lookup_dir_ent<C: GenericConnection>(
