@@ -1,6 +1,7 @@
 use super::sql;
 use fuse::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, Request,
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite,
+    Request,
 };
 use libc::{c_int, ECONNREFUSED, ENOENT, ENOTDIR};
 use std::ffi::OsStr;
@@ -21,7 +22,6 @@ impl CockroachFS {
 }
 
 impl Filesystem for CockroachFS {
-    
     /// Initialize filesystem.
     /// Called before any other filesystem method.
     fn init(&mut self, _req: &Request) -> Result<(), c_int> {
@@ -127,6 +127,15 @@ impl Filesystem for CockroachFS {
         };
     }
 
+    /// Remove a file.
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        match sql::unlink(&self.conn, parent, name.to_str().unwrap()) {
+            Err(_) => reply.error(ECONNREFUSED),
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(_)) => reply.ok(),
+        };
+    }
+
     /// Rename a file.
     fn rename(
         &mut self,
@@ -151,35 +160,23 @@ impl Filesystem for CockroachFS {
     }
 
     /// Create a hard link.
-    fn link(&mut self, _req: &Request, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
-        match sql::link(
-            &self.conn,
-            ino,
-            newparent,
-            newname.to_str().unwrap(),
-        ) {
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        match sql::link(&self.conn, ino, newparent, newname.to_str().unwrap()) {
             Err(err) => {
                 println!("link: {}", err);
                 reply.error(ECONNREFUSED)
-            },
+            }
             Ok(None) => reply.error(ENOENT),
             Ok(Some(attr)) => reply.entry(&TTL, &attr, 0),
         };
     }
-
-    /// Remove a file.
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match sql::unlink(
-            &self.conn,
-            parent,
-            name.to_str().unwrap(),
-        ) {
-            Err(_) => reply.error(ECONNREFUSED),
-            Ok(None) => reply.error(ENOENT),
-            Ok(Some(_)) => reply.ok(),
-        };
-    }
-
 
     /// Read data.
     /// Read should send exactly the number of bytes requested except on EOF or error,
@@ -194,15 +191,46 @@ impl Filesystem for CockroachFS {
         ino: u64,
         _fh: u64,
         offset: i64,
-        _size: u32,
+        size: u32,
         reply: ReplyData,
     ) {
         println!("read");
-        if ino == 2 {
-            reply.data(&"Hello World!\n".as_bytes()[offset as usize..]);
-        } else {
-            reply.error(ENOENT);
-        }
+        match sql::read_data(&self.conn, ino, offset, size as usize) {
+            Err(_) => reply.error(ECONNREFUSED),
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(data)) => reply.data(data.as_slice()),
+        };
+    }
+
+    /// Write data.
+    /// Write should return exactly the number of bytes requested except on error. An
+    /// exception to this is when the file has been opened in 'direct_io' mode, in
+    /// which case the return value of the write system call will reflect the return
+    /// value of this operation. fh will contain the value set by the open method, or
+    /// will be undefined if the open method didn't set any value.
+    fn write(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _flags: u32,
+        reply: ReplyWrite,
+    ) {
+        println!("write");
+        match sql::write_data(&self.conn, ino, offset, data) {
+            Err(_) => reply.error(ECONNREFUSED),
+            Ok(None) => reply.error(ENOENT),
+            Ok(Some(size)) => reply.written(size as u32),
+        };
+    }
+
+    /// Synchronize file contents.
+    /// If the datasync parameter is non-zero, then only the user data should be flushed,
+    /// not the meta data.
+    fn fsync(&mut self, _req: &Request, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        reply.ok()
     }
 
     /// Read directory.
@@ -230,15 +258,12 @@ impl Filesystem for CockroachFS {
             return;
         }
         match sql::read_dir(&self.conn, ino, offset) {
-            Err(err) => {
-                println!("failed to read_dir: {}", err);
-                reply.error(ECONNREFUSED)
-            },
+            Err(_) => reply.error(ECONNREFUSED),
             Ok(ents) => {
                 for (i, ent) in ents.iter().enumerate() {
                     reply.add(
                         ent.child_ino,
-                        offset+1+(i as i64),
+                        offset + 1 + (i as i64),
                         ent.child_kind,
                         &ent.child_name,
                     );

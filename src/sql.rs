@@ -1,6 +1,7 @@
 use fuse::{FileAttr, FileType};
 use postgres::rows::Row;
-use postgres::{Connection, Result, GenericConnection};
+use postgres::{GenericConnection, Result};
+use std::cmp;
 
 const SCHEMAS: &[&str] = &[
     "CREATE SEQUENCE IF NOT EXISTS inode_alloc",
@@ -30,9 +31,12 @@ const SCHEMAS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS blocks (
         file_ino  INT8 NOT NULL REFERENCES inodes (ino),
         block_idx INT8 NOT NULL,
+        bytes     BYTES NOT NULL DEFAULT repeat(x'00'::string, 1024)::bytes,
         PRIMARY KEY (file_ino, block_idx)
     )",
 ];
+
+const DATA_BLOCK_SIZE: i64 = 1 << 10;
 
 #[derive(Debug)]
 pub struct DirEntry {
@@ -42,15 +46,15 @@ pub struct DirEntry {
     pub child_name: String,
 }
 
-pub fn create_schema(conn: &Connection) -> Result<()> {
+pub fn create_schema<C: GenericConnection>(conn: &C) -> Result<()> {
     for table in SCHEMAS {
         conn.execute(table, &[]).map(|_| ())?;
     }
     Ok(())
 }
 
-pub fn create_inode(
-    conn: &Connection,
+pub fn create_inode<C: GenericConnection>(
+    conn: &C,
     parent: u64,
     name: &str,
     ft: FileType,
@@ -77,11 +81,7 @@ pub fn create_inode(
     Ok(attr)
 }
 
-pub fn unlink(
-    conn: &Connection,
-    parent: u64,
-    name: &str,
-) -> Result<Option<()>> {
+pub fn unlink<C: GenericConnection>(conn: &C, parent: u64, name: &str) -> Result<Option<()>> {
     println!("unlink: {} in {}", name, parent);
     let txn = conn.transaction()?;
     let mut inode = match lookup_dir_ent(&txn, parent, name)? {
@@ -103,8 +103,8 @@ pub fn unlink(
     return Ok(Some(()));
 }
 
-pub fn link(
-    conn: &Connection, 
+pub fn link<C: GenericConnection>(
+    conn: &C,
     ino: u64,
     parent: u64,
     newname: &str,
@@ -124,7 +124,7 @@ pub fn link(
     txn.execute(
         "INSERT INTO dir_entries
          VALUES ($1, $2, $3, $4)",
-         &[&(parent as i64), &newname, &kind_str, &(ino as i64)],
+        &[&(parent as i64), &newname, &kind_str, &(ino as i64)],
     )?;
     inode.nlink += 1;
     update_nlink(&txn, inode.ino, inode.nlink)?;
@@ -132,7 +132,7 @@ pub fn link(
     Ok(Some(inode))
 }
 
-pub fn lookup_inode_kind(conn: &Connection, ino: u64) -> Result<Option<FileType>> {
+pub fn lookup_inode_kind<C: GenericConnection>(conn: &C, ino: u64) -> Result<Option<FileType>> {
     conn.query("SELECT kind FROM inodes WHERE ino = $1", &[&(ino as i64)])
         .map(|rows| {
             if rows.len() == 0 {
@@ -158,11 +158,12 @@ pub fn lookup_inode<C: GenericConnection>(conn: &C, ino: u64) -> Result<Option<F
 
 // }
 
-pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry>> {
+pub fn read_dir<C: GenericConnection>(conn: &C, ino: u64, offset: i64) -> Result<Vec<DirEntry>> {
     conn.query(
         "SELECT * FROM dir_entries WHERE dir_ino = $1 ORDER BY child_name OFFSET $2 ROWS",
         &[&(ino as i64), &(offset)],
-    ).map(|rows| {
+    )
+    .map(|rows| {
         rows.iter()
             .map(|row| DirEntry {
                 dir_ino: row.get::<_, i64>(0) as u64,
@@ -175,18 +176,16 @@ pub fn read_dir(conn: &Connection, ino: u64, offset: i64) -> Result<Vec<DirEntry
 }
 
 pub fn delete_file<C: GenericConnection>(conn: &C, ino: u64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM inodes WHERE ino = $1",
-        &[&(ino as i64)],
-    )?;
-    conn.execute(
-        "DELETE FROM blocks WHERE file_ino = $1",
-        &[&(ino as i64)],
-    )?;
+    conn.execute("DELETE FROM inodes WHERE ino = $1", &[&(ino as i64)])?;
+    conn.execute("DELETE FROM blocks WHERE file_ino = $1", &[&(ino as i64)])?;
     Ok(())
 }
 
-pub fn lookup_dir_ent<C: GenericConnection>(conn: &C, parent: u64, name: &str) -> Result<Option<FileAttr>> {
+pub fn lookup_dir_ent<C: GenericConnection>(
+    conn: &C,
+    parent: u64,
+    name: &str,
+) -> Result<Option<FileAttr>> {
     conn.query(
         "SELECT i.* FROM inodes i 
          JOIN dir_entries d 
@@ -203,11 +202,7 @@ pub fn lookup_dir_ent<C: GenericConnection>(conn: &C, parent: u64, name: &str) -
     })
 }
 
-pub fn update_nlink<C: GenericConnection>(
-    conn: &C,
-    ino: u64,
-    nlink: u32,
-) -> Result<()> {
+pub fn update_nlink<C: GenericConnection>(conn: &C, ino: u64, nlink: u32) -> Result<()> {
     conn.execute(
         "UPDATE inodes
          SET (nlink) = ($1)
@@ -217,8 +212,8 @@ pub fn update_nlink<C: GenericConnection>(
     return Ok(());
 }
 
-pub fn rename_dir_ent(
-    conn: &Connection,
+pub fn rename_dir_ent<C: GenericConnection>(
+    conn: &C,
     parent: u64,
     name: &str,
     new_parent: u64,
@@ -231,6 +226,148 @@ pub fn rename_dir_ent(
         &[&(new_parent as i64), &new_name, &(parent as i64), &name],
     )
     .map(|num| num == 1)
+}
+
+pub fn read_data<C: GenericConnection>(
+    conn: &C,
+    ino: u64,
+    offset: i64,
+    size: usize,
+) -> Result<Option<Vec<u8>>> {
+    let txn = conn.transaction()?;
+    let cur_inode: Option<i64> = txn
+        .query("SELECT size FROM inodes WHERE ino = $1", &[&(ino as i64)])
+        .map(|rows| {
+            if rows.len() == 0 {
+                None
+            } else {
+                Some(rows.get(0).get(0))
+            }
+        })?;
+    match cur_inode {
+        Some(cur_size) => {
+            if cur_size < offset + size as i64 {
+                return Ok(None);
+            }
+        }
+        None => return Ok(None),
+    };
+
+    let start_block = offset / DATA_BLOCK_SIZE;
+    let end_block = (offset + size as i64) / DATA_BLOCK_SIZE;
+    let mut data = txn
+        .query(
+            "SELECT bytes FROM blocks 
+            WHERE file_ino = $1 AND block_idx BETWEEN $2 AND $3",
+            &[&(ino as i64), &(start_block as i64), &(end_block as i64)],
+        )?
+        .into_iter()
+        .map(|row| row.get::<_, Vec<u8>>(0))
+        .fold(Vec::with_capacity(size), |mut data, mut bytes| {
+            data.append(&mut bytes);
+            data
+        });
+    data.truncate(size);
+
+    txn.commit()?;
+    Ok(Some(data))
+}
+
+pub fn write_data<C: GenericConnection>(
+    conn: &C,
+    ino: u64,
+    offset: i64,
+    data: &[u8],
+) -> Result<Option<usize>> {
+    let txn = conn.transaction()?;
+    let cur_inode: Option<(i64, i64)> = txn
+        .query(
+            "SELECT size, blocks FROM inodes WHERE ino = $1",
+            &[&(ino as i64)],
+        )
+        .map(|rows| {
+            if rows.len() == 0 {
+                None
+            } else {
+                let row = rows.get(0);
+                Some((row.get(0), row.get(1)))
+            }
+        })?;
+    let (cur_size, cur_blocks) = match cur_inode {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    // Pad out to the offset.
+    let before = offset / DATA_BLOCK_SIZE;
+    for i in cur_blocks..before {
+        txn.execute(
+            "INSERT INTO blocks
+             VALUES ($1, $2, DEFAULT)",
+            &[&(ino as i64), &(i as i64)],
+        )?;
+    }
+
+    let mut cur_block = before;
+    let mut cur_offset = offset % DATA_BLOCK_SIZE;
+    let mut created_blocks = 0;
+    let mut data_left = data;
+    while data_left.len() > 0 {
+        let avail = (DATA_BLOCK_SIZE - cur_offset) as usize;
+        let left = data_left.len();
+        let chunk_size = if left >= avail { avail } else { left };
+        let chunk = &data_left[0..chunk_size];
+        let after = avail - chunk_size;
+        if cur_blocks <= cur_block {
+            // Create new block.
+            txn.execute(
+                "INSERT INTO blocks
+                 VALUES ($1, $2, repeat(x'00'::string, $3)::bytes || $4 || repeat(x'00'::string, $5)::bytes)",
+                &[
+                    &(ino as i64),
+                    &(cur_block as i64),
+                    &(cur_offset as i64),
+                    &chunk,
+                    &(after as i64),
+                ],
+            )?;
+            created_blocks = created_blocks + 1;
+        } else {
+            // Modify cur block.
+            txn.execute(
+                "UPDATE blocks
+                 SET bytes = substr(convert_from(bytes, 'utf8'), 1, $1)::bytes || 
+                             $2 || 
+                             substr(convert_from(bytes, 'utf8'), $3+1)::bytes
+                 WHERE file_ino = $4 AND block_idx = $5",
+                &[
+                    &(cur_offset as i64),
+                    &chunk,
+                    &(cur_offset + chunk_size as i64),
+                    &(ino as i64),
+                    &(cur_block as i64),
+                ],
+            )?;
+        }
+        cur_block += 1;
+        cur_offset = 0;
+        data_left = &data_left[chunk_size..];
+    }
+
+    // Update the inode with the new size and block count.
+    let touched_size = offset + data.len() as i64;
+    let new_size = cmp::max(cur_size, touched_size);
+    let new_blocks = cur_blocks + created_blocks as i64;
+    let num_updated = txn.execute(
+        "UPDATE inodes SET blocks = $1, size = $2 WHERE ino = $3",
+        &[&new_size, &new_blocks, &(ino as i64)],
+    )?;
+    if num_updated != 1 {
+        return Ok(None);
+    }
+
+    txn.commit()?;
+    Ok(Some(data.len()))
 }
 
 fn row_to_file_attr(row: Row) -> FileAttr {
